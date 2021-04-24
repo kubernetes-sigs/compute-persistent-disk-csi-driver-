@@ -41,7 +41,14 @@ gce-pd-driver-windows:
 	mkdir -p bin
 	GOOS=windows go build -mod=vendor -ldflags -X=main.version=$(STAGINGVERSION) -o bin/${DRIVERWINDOWSBINARY} ./cmd/gce-pd-csi-driver/
 
-build-container: require-GCE_PD_CSI_STAGING_IMAGE init-buildx
+# build and keep in the local registry the container. It build only for linux/amd64 platform
+build-container-linux: require-GCE_PD_CSI_STAGING_IMAGE init-buildx
+	$(DOCKER) buildx build --platform=linux \
+		-t $(STAGINGIMAGE):$(STAGINGVERSION) \
+		--build-arg STAGINGVERSION=$(STAGINGVERSION) --load .
+
+# build and push to a remote registry defined in GCE_PD_CSI_STAGING_IMAGE. It build only for linux/amd64 platform
+build-and-push-container-linux: require-GCE_PD_CSI_STAGING_IMAGE init-buildx
 	$(DOCKER) buildx build --platform=linux \
 		-t $(STAGINGIMAGE):$(STAGINGVERSION) \
 		--build-arg STAGINGVERSION=$(STAGINGVERSION) --push .
@@ -79,8 +86,6 @@ build-and-push-multi-arch-debug: build-and-push-container-linux-debug build-and-
 	$(DOCKER) manifest create --amend $(STAGINGIMAGE):$(STAGINGVERSION) $(STAGINGIMAGE):$(STAGINGVERSION)_linux $(STAGINGIMAGE):$(STAGINGVERSION)_ltsc2019
 	STAGINGIMAGE="$(STAGINGIMAGE)" STAGINGVERSION="$(STAGINGVERSION)" WINDOWS_IMAGE_TAGS="ltsc2019" WINDOWS_BASE_IMAGES="$(BASE_IMAGE_LTSC2019)" ./manifest_osversion.sh
 	$(DOCKER) manifest push -p $(STAGINGIMAGE):$(STAGINGVERSION)
-
-push-container: build-container
 
 build-and-push-container-linux-amd64: require-GCE_PD_CSI_STAGING_IMAGE init-buildx
 	$(DOCKER) buildx build --platform=linux/amd64 \

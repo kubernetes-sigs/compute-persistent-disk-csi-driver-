@@ -149,7 +149,7 @@ func pushImage(pkgDir, stagingImage, stagingVersion, platform string) error {
 			return fmt.Errorf("failed to run make command for windows: err: %v", err)
 		}
 	} else {
-		cmd = exec.Command("make", "-C", pkgDir, "push-container",
+		cmd = exec.Command("make", "-C", pkgDir, "build-and-push-container-linux",
 			fmt.Sprintf("GCE_PD_CSI_STAGING_VERSION=%s", stagingVersion),
 			fmt.Sprintf("GCE_PD_CSI_STAGING_IMAGE=%s", stagingImage))
 		err = runCommand("Pushing GCP Container for Linux", cmd)
