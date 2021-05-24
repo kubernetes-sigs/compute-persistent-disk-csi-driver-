@@ -46,6 +46,28 @@ const (
 	GCEAPIVersionV1 GCEAPIVersion = "v1"
 	// Alpha key type
 	GCEAPIVersionBeta GCEAPIVersion = "beta"
+	// OpPollInterval is the ineterval between polling an operation
+	OpPollInterval = 1 * time.Second
+	// OpTimeout is the default total timeout for polling on an operation
+	OpTimeout = 2 * time.Minute
+	// defaultCallTimeout is the ddefault context timeout for creating/getting on an operation
+	defaultCallTimeout = 10 * time.Minute
+	// Time interval for checking on an operation
+	AttachDiskInitialDelay = 6 * time.Second
+
+	InsertDiskInitialDelay = 3 * time.Second
+
+	// volumeAttachmentConsecutiveErrorLimit is the number of consecutive errors we will ignore when waiting for a volume to attach/detach
+	//volumeAttachmentStatusConsecutiveErrorLimit = 10
+
+	// Attach typically takes 2-5 seconds (average is 2). Asking before 2 seconds is just waste of API quota.
+	volumeAttachmentStatusInitialDelay = 2 * time.Second
+	// Detach typically takes 5-10 seconds (average is 6). Asking before 5 seconds is just waste of API quota.
+	volumeDetachmentStatusInitialDelay = 5 * time.Second
+	// After the initial delay, poll attach/detach with exponential backoff (2046 seconds total)
+	volumeAttachmentStatusPollDelay = 2 * time.Second
+	volumeAttachmentStatusFactor    = 2
+	volumeAttachmentStatusSteps     = 11
 )
 
 type GCECompute interface {
@@ -306,6 +328,11 @@ func ValidateDiskParameters(disk *CloudDisk, params common.DiskParameters) error
 	return nil
 }
 
+// ContextWithCallTimeout returns a context with a default timeout, used for generated client calls.
+func ContextWithCallTimeout() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), defaultCallTimeout)
+}
+
 func (cloud *CloudProvider) InsertDisk(ctx context.Context, volKey *meta.Key, params common.DiskParameters, capBytes int64, capacityRange *csi.CapacityRange, replicaZones []string, snapshotID string, multiWriter bool) error {
 	klog.V(5).Infof("Inserting disk %v", volKey)
 
@@ -491,17 +518,20 @@ func (cloud *CloudProvider) insertZonalDisk(
 		}
 	}
 
+	callCtx, cancel := ContextWithCallTimeout()
+	defer cancel()
+
 	if gceAPIVersion == GCEAPIVersionBeta {
 		var insertOp *computebeta.Operation
 		betaDiskToCreate := convertV1DiskToBetaDisk(diskToCreate)
 		betaDiskToCreate.MultiWriter = multiWriter
-		insertOp, err = cloud.betaService.Disks.Insert(cloud.project, volKey.Zone, betaDiskToCreate).Context(ctx).Do()
+		insertOp, err = cloud.betaService.Disks.Insert(cloud.project, volKey.Zone, betaDiskToCreate).Context(callCtx).Do()
 		if insertOp != nil {
 			opName = insertOp.Name
 		}
 	} else {
 		var insertOp *computev1.Operation
-		insertOp, err = cloud.service.Disks.Insert(cloud.project, volKey.Zone, diskToCreate).Context(ctx).Do()
+		insertOp, err = cloud.service.Disks.Insert(cloud.project, volKey.Zone, diskToCreate).Context(callCtx).Do()
 		if insertOp != nil {
 			opName = insertOp.Name
 		}
@@ -525,7 +555,7 @@ func (cloud *CloudProvider) insertZonalDisk(
 		}
 		return fmt.Errorf("unknown Insert disk error: %v", err)
 	}
-
+	klog.Infof("Insert disk %s op id %s", volKey.Name, opName)
 	err = cloud.waitForZonalOp(ctx, opName, volKey.Zone)
 
 	if err != nil {
@@ -570,6 +600,7 @@ func (cloud *CloudProvider) deleteZonalDisk(ctx context.Context, zone, name stri
 		}
 		return err
 	}
+	klog.Infof("delete disk %s op id %s", name, op.Name)
 	err = cloud.waitForZonalOp(ctx, op.Name, zone)
 	if err != nil {
 		return err
@@ -609,26 +640,53 @@ func (cloud *CloudProvider) AttachDisk(ctx context.Context, volKey *meta.Key, re
 		Type:       diskType,
 	}
 
-	op, err := cloud.service.Instances.AttachDisk(cloud.project, instanceZone, instanceName, attachedDiskV1).Context(ctx).Do()
+	callCtx, cancel := ContextWithCallTimeout()
+	defer cancel()
+
+	op, err := cloud.service.Instances.AttachDisk(cloud.project, instanceZone, instanceName, attachedDiskV1).Context(callCtx).Do()
 	if err != nil {
-		return fmt.Errorf("failed cloud service attach disk call: %v", err)
+		return fmt.Errorf("failed cloud service attach disk %v call: %v", volKey, err)
 	}
-	err = cloud.waitForZonalOp(ctx, op.Name, instanceZone)
+	klog.V(5).Infof("Attaching disk %s operation id is %s", volKey, op.Name)
+	time.Sleep(2 * time.Second)
+
+	op2, err2 := cloud.service.Instances.AttachDisk(cloud.project, instanceZone, instanceName, attachedDiskV1).Context(callCtx).Do()
+	if err2 != nil {
+		klog.Errorf("failed cloud service attach disk %v call op2 %v: %v", volKey, op2, err2)
+		//return fmt.Errorf("failed cloud service attach disk %v call op2 %v: %v", volKey, op2, err2)
+	} else {
+		klog.V(2).Infof("Attaching disk %s op2 id is %s", volKey, op2.Name)
+	}
+
+	klog.V(5).Infof("Attaching disk %s operation id is %s", volKey, op.Name)
+
+	/*err = cloud.waitForZonalOp2(ctx, op.Name, instanceZone)
 	if err != nil {
-		return fmt.Errorf("failed when waiting for zonal op: %v", err)
+		klog.Errorf("failed when waiting for zonal op %s on attaching volume %v: %v", op.Name, volKey, err)
+		//return fmt.Errorf("failed when waiting for zonal op %s on attaching volume %v: %v", op.Name, volKey, err)
+	}*/
+
+	err = cloud.waitForZonalOp2(ctx, op.Name, op2.Name, instanceName, instanceZone, volKey)
+	if err != nil {
+		return fmt.Errorf("failed when waiting for zonal op %s op2 %s on attaching volume %v: %v", op.Name, op2.Name, volKey, err)
 	}
 	return nil
 }
 
 func (cloud *CloudProvider) DetachDisk(ctx context.Context, deviceName, instanceZone, instanceName string) error {
-	klog.V(5).Infof("Detaching disk %v from %v", deviceName, instanceName)
-	op, err := cloud.service.Instances.DetachDisk(cloud.project, instanceZone, instanceName, deviceName).Context(ctx).Do()
+
+	callCtx, cancel := ContextWithCallTimeout()
+	defer cancel()
+
+	klog.V(5).Infof("Detaching disk %s from %v", deviceName, instanceName)
+	op, err := cloud.service.Instances.DetachDisk(cloud.project, instanceZone, instanceName, deviceName).Context(callCtx).Do()
 	if err != nil {
 		return err
 	}
+	klog.V(5).Infof("Detaching disk %s operation id is %s", deviceName, op.Name)
 	err = cloud.waitForZonalOp(ctx, op.Name, instanceZone)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed when waiting for zonal op %s on detaching volume %s: %v", op.Name, deviceName, err)
 	}
 	return nil
 }
@@ -679,18 +737,86 @@ func (cloud *CloudProvider) getRegionalDiskTypeURI(region, diskType string) stri
 	return cloud.service.BasePath + fmt.Sprintf(diskTypeURITemplateRegional, cloud.project, region, diskType)
 }
 
+// SleepWithContext will wait for the timer duration to expire, or the context
+// is canceled. Which ever happens first. If the context is canceled the Context's
+// error will be returned.
+//
+// Expects Context to always return a non-nil error if the Done channel is closed.
+/*func SleepWithContext(ctx Context, dur time.Duration) error {
+	t := time.NewTimer(dur)
+	defer t.Stop()
+
+	select {
+	case <-t.C:
+		break
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	return nil
+}*/
+
 func (cloud *CloudProvider) waitForZonalOp(ctx context.Context, opName string, zone string) error {
 	// The v1 API can query for v1, alpha, or beta operations.
 	svc := cloud.service
 	project := cloud.project
-	return wait.Poll(3*time.Second, 5*time.Minute, func() (bool, error) {
+	timeout := OpTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = time.Until(deadline)
+		klog.Infof("Getting timeout from passed context  opname %s %v", opName, timeout)
+	}
+	//callCtx, cancel := ContextWithCallTimeout()
+	//defer cancel()
+
+	return wait.Poll(OpPollInterval, timeout, func() (bool, error) {
 		pollOp, err := svc.ZoneOperations.Get(project, zone, opName).Context(ctx).Do()
 		if err != nil {
-			klog.Errorf("WaitForOp(op: %s, zone: %#v) failed to poll the operation", opName, zone)
+			klog.Errorf("WaitForOp(op: %s, zone: %#v) failed to poll the operation: %v", opName, zone, err)
 			return false, err
 		}
 		done, err := opIsDone(pollOp)
+		klog.V(4).Infof("checking op %s is done %t", opName, done)
 		return done, err
+	})
+}
+
+func (cloud *CloudProvider) waitForZonalOp2(ctx context.Context, opName, opName2 string, instance, zone string, volKey *meta.Key) error {
+	// The v1 API can query for v1, alpha, or beta operations.
+	svc := cloud.service
+	project := cloud.project
+	timeout := OpTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = time.Until(deadline)
+		klog.Infof("Getting timeout from passed context  opname %s %v", opName, timeout)
+	}
+	//callCtx, cancel := ContextWithCallTimeout()
+	//defer cancel()
+
+	return wait.Poll(OpPollInterval, timeout, func() (bool, error) {
+		pollOp, err := svc.ZoneOperations.Get(project, zone, opName).Context(ctx).Do()
+		if err != nil {
+			klog.Errorf("WaitForOp(op: %s, zone: %#v) failed to poll the operation: %v", opName, zone, err)
+			return false, err
+		}
+		done, err := opIsDone(pollOp)
+		klog.V(4).Infof("checking op %s is done %t %v", opName, done, err)
+
+		pollOp, err = svc.ZoneOperations.Get(project, zone, opName2).Context(ctx).Do()
+		if err != nil {
+			klog.Errorf("WaitForOp(op: %s, zone: %#v) failed to poll the operation2: %v", opName2, zone, err)
+			return false, err
+		}
+		done2, err2 := opIsDone(pollOp)
+		klog.V(4).Infof("checking op2 %s is done %t %v", opName2, done2, err2)
+
+		if done || done2 {
+			_, err = cloud.WaitForAttach2(ctx, volKey, zone, instance)
+			if err != nil {
+				klog.Errorf("volkey  %v unknown WaitForAttach error: %v", volKey, err)
+				//return nil, status.Error(codes.Internal, fmt.Sprintf("unknown WaitForAttach error: %v", err))
+			}
+		}
+		return done && done2, err
 	})
 }
 
@@ -725,7 +851,7 @@ func (cloud *CloudProvider) WaitForAttach(ctx context.Context, volKey *meta.Key,
 	klog.V(5).Infof("Waiting for attach of disk %v to instance %v to complete...", volKey.Name, instanceName)
 	start := time.Now()
 	return wait.Poll(5*time.Second, 2*time.Minute, func() (bool, error) {
-		klog.V(6).Infof("Polling for attach of disk %v to instance %v to complete for %v", volKey.Name, instanceName, time.Since(start))
+		klog.V(5).Infof("Polling for attach of disk %v to instance %v to complete for %v", volKey.Name, instanceName, time.Since(start))
 		disk, err := cloud.GetDisk(ctx, volKey, GCEAPIVersionV1)
 		if err != nil {
 			return false, fmt.Errorf("GetDisk failed to get disk: %v", err)
@@ -744,8 +870,35 @@ func (cloud *CloudProvider) WaitForAttach(ctx context.Context, volKey *meta.Key,
 	})
 }
 
+func (cloud *CloudProvider) WaitForAttach2(ctx context.Context, volKey *meta.Key, instanceZone, instanceName string) (bool, error) {
+	klog.V(5).Infof("Waiting for attach of disk %v to instance %v to complete...", volKey.Name, instanceName)
+	start := time.Now()
+	//return wait.Poll(1*time.Second, 2*time.Second, func() (bool, error) {
+	klog.V(5).Infof("Polling for attach of disk %v to instance %v to complete for %v", volKey.Name, instanceName, time.Since(start))
+	disk, err := cloud.GetDisk(ctx, volKey, GCEAPIVersionV1)
+	if err != nil {
+		return false, fmt.Errorf("GetDisk failed to get disk: %v", err)
+	}
+
+	if disk == nil {
+		return false, fmt.Errorf("Disk %v could not be found", volKey.Name)
+	}
+
+	for _, user := range disk.GetUsers() {
+		if strings.Contains(user, instanceName) && strings.Contains(user, instanceZone) {
+			klog.Infof("disk %v is attachd ", volKey)
+			return true, nil
+		}
+	}
+	return false, nil
+	//})
+}
+
 func opIsDone(op *computev1.Operation) (bool, error) {
-	if op == nil || op.Status != operationStatusDone {
+	if op == nil {
+		return true, fmt.Errorf("operation is nil")
+	}
+	if op.Status != operationStatusDone {
 		return false, nil
 	}
 	if op.Error != nil && len(op.Error.Errors) > 0 && op.Error.Errors[0] != nil {
