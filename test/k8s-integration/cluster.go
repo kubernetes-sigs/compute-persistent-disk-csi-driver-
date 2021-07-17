@@ -108,6 +108,13 @@ func clusterUpGCE(k8sDir, gceZone string, numNodes int, imageType string) error 
 		}
 	}
 
+	// we shouldn't install pd-csi driver when spinning up the cluster if we launch the test
+	// from here
+	err = os.Setenv("ENABLE_PDCSI_DRIVER", "false")
+	if err != nil {
+		return err
+	}
+
 	err = os.Setenv("KUBE_GCE_ZONE", gceZone)
 	if err != nil {
 		return err
