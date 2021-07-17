@@ -185,8 +185,6 @@ func clusterUpGKE(gceZone, gceRegion string, numNodes int, imageType string, use
 	}
 
 	if useManagedDriver {
-		// PD CSI Driver add on is enabled only in gcloud beta.
-		cmdParams = append([]string{"beta"}, cmdParams...)
 		cmdParams = append(cmdParams, "--addons", "GcePersistentDiskCsiDriver")
 	}
 
